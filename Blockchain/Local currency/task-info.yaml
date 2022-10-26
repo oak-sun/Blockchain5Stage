@@ -1,0 +1,1553 @@
+type: edu
+files:
+- name: src/blockchain/Main.java
+  visible: true
+  text: |+
+    package blockchain;
+
+    import blockchain.management.TaskManager;
+
+    public class Main {
+
+        public static void main(String[] args) {
+            new TaskManager().run();
+        }
+    }
+
+
+
+  learner_created: false
+- name: src/blockchain/util/StringUtil.java
+  visible: true
+  text: |-
+    package blockchain.util;
+
+    import java.nio.charset.StandardCharsets;
+    import java.security.MessageDigest;
+
+    public class StringUtil {
+        public static String applySha256(String input){
+            try {
+                /* Applies sha256 to our input */
+                var hash =  MessageDigest
+                                  .getInstance("SHA-256")
+                                  .digest(input
+                                          .getBytes(StandardCharsets.UTF_8));
+                var hexString = new StringBuilder();
+                for (byte elem: hash) {
+                    var hex = Integer.toHexString(0xff & elem);
+                    if(hex.length() == 1) hexString.append('0');
+                    hexString.append(hex);
+                }
+                return hexString.toString();
+            }
+            catch(Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+    }
+  learner_created: false
+- name: src/blockchain/util/Serializer.java
+  visible: true
+  text: |-
+    package blockchain.util;
+
+    import blockchain.model.Blockchain;
+    import lombok.extern.slf4j.Slf4j;
+
+    import java.io.BufferedInputStream;
+    import java.io.BufferedOutputStream;
+    import java.io.FileInputStream;
+    import java.io.FileNotFoundException;
+    import java.io.FileOutputStream;
+    import java.io.IOException;
+    import java.io.ObjectInputStream;
+    import java.io.ObjectOutputStream;
+    import static blockchain.util.PreInstaller
+            .SERIALIZE_PATH;
+
+
+    @Slf4j
+    public class Serializer {
+
+        public void serialize(Blockchain bChain) {
+            try (var oos = new ObjectOutputStream(
+                    new BufferedOutputStream(
+                            new FileOutputStream(
+                                    SERIALIZE_PATH)))) {
+                oos.writeObject(bChain);
+            } catch (IOException exception) {
+                log.error(
+                        "cannot serialize to file " +
+                                SERIALIZE_PATH +
+                                "\n" +
+                                exception.getMessage());
+            }
+        }
+
+        public Blockchain deserialize() {
+
+            try (var ois = new ObjectInputStream(
+                    new BufferedInputStream(
+                            new FileInputStream(
+                                    SERIALIZE_PATH)))) {
+                return (Blockchain) ois.readObject();
+
+            } catch (FileNotFoundException exception) {
+                log.trace("No serialization data found.");
+
+            } catch (IOException exception) {
+                log.error("IO-error reading deserialization file " +
+                        SERIALIZE_PATH +
+                        "!\n"
+                        + exception.getMessage());
+            } catch (ClassNotFoundException exception) {
+                log.error("cannot deserialize file " +
+                        SERIALIZE_PATH +
+                        ". File corrupted!\n" +
+                        exception.getMessage());
+            }
+            return new Blockchain();
+        }
+    }
+  learner_created: false
+- name: src/blockchain/management/TasksManager.java
+  visible: true
+  text: |-
+    package blockchain.management;
+
+    import blockchain.model.block.Block;
+    import blockchain.model.Blockchain;
+    import blockchain.model.factories.ChatFactory;
+    import blockchain.util.InvalidBlockchainException;
+    import blockchain.util.Recorder;
+    import lombok.extern.slf4j.Slf4j;
+    import java.io.IOException;
+    import java.security.KeyPair;
+    import java.security.NoSuchAlgorithmException;
+    import java.util.ArrayList;
+    import java.util.Collections;
+    import java.util.List;
+    import java.util.concurrent.Callable;
+    import java.util.concurrent.ExecutorService;
+    import java.util.concurrent.Executors;
+
+    import static blockchain.util.PreInstaller.BLOCKCHAIN_LENGTH;
+    import static blockchain.util.PreInstaller.CHAT_CLIENT_COUNT;
+    import static blockchain.util.PreInstaller.CLIENTS;
+    import static blockchain.util.PreInstaller.KEY_PAIRS_PATH_PREFIX;
+    import static blockchain.util.PreInstaller.MINER_COUNT;
+    import static blockchain.util.PreInstaller.PRIVATE_KEY_SUFFIX;
+    import static blockchain.util.PreInstaller.PUBLIC_KEY_SUFFIX;
+    import static blockchain.util.PreInstaller.RSA_KEY_LENGTH;
+
+
+    @Slf4j
+    public class TaskManager {
+
+        private final Recorder recorder = new Recorder();
+        private Blockchain bChain;
+        private ExecutorService chatClients;
+
+        public void run() {
+            chatClients = Executors
+                    .newFixedThreadPool(CHAT_CLIENT_COUNT);
+            try {
+                bChain = Blockchain
+                        .getSerializer()
+                        .deserialize();
+                bChain.resetIfInvalid();
+                startChatClients(chatClients);
+                continueGeneration(bChain.size());
+                recorder.print(bChain);
+            } catch (InvalidBlockchainException exc) {
+                errorExit("Invalid blockchain detected: ",
+                        exc);
+            }
+            chatClients.shutdownNow();
+        }
+
+        private void startChatClients(ExecutorService chatClients) {
+            var keys = generateKeyPairs();
+            for (int i = 0; i < CHAT_CLIENT_COUNT; i++) {
+                chatClients.submit(
+                        new UserManager(bChain,
+                                         CLIENTS.get(i),
+                                keys.get(i)));
+            }
+        }
+
+        private List<KeyPair> generateKeyPairs() {
+            List <KeyPair> keyList = new ArrayList<>(
+                    CHAT_CLIENT_COUNT);
+            try {
+                var keyGenerator = new KeysManager(
+                        RSA_KEY_LENGTH);
+
+                for (int i = 0; i < CHAT_CLIENT_COUNT; i++) {
+
+                    keyGenerator.createKeys(
+                            KEY_PAIRS_PATH_PREFIX +
+                                    CLIENTS.get(i) +
+                                    PUBLIC_KEY_SUFFIX,
+                            KEY_PAIRS_PATH_PREFIX +
+                                    CLIENTS.get(i) +
+                                    PRIVATE_KEY_SUFFIX);
+                    keyList.add(keyGenerator.getKeyPair());
+
+                    log.info("Private/Public keypair " +
+                            "generated for" +
+                            " chat client " +
+                            CLIENTS.get(i));
+                }
+
+            } catch (NoSuchAlgorithmException |
+                     IOException exc) {
+                errorExit("Error RSA-encoding key pair:",
+                        exc);
+            }
+            return keyList;
+        }
+
+        private void continueGeneration(int createdBlocks) {
+            var leadingHashZeros = 0;
+            var miners = Executors
+                    .newFixedThreadPool(MINER_COUNT);
+
+            while (createdBlocks < BLOCKCHAIN_LENGTH) {
+                try {
+
+                    if (!bChain
+                            .addBlock(miners
+                                    .invokeAny(getMineTasks(
+                                    ++createdBlocks,
+                                            leadingHashZeros)))) {
+                        throw new InvalidBlockchainException(
+                                "Invalid block received by" +
+                                        " miner !");
+                    }
+
+                } catch (Exception exc) {
+                    miners.shutdownNow();
+                    errorExit("Exception while blockchain creation: ",
+                            exc);
+                    Thread
+                            .currentThread()
+                            .interrupt();
+                }
+                leadingHashZeros = bChain
+                        .adaptLeadingHashZeros();
+            }
+            miners.shutdownNow();
+        }
+
+        private List<Callable<Block>> getMineTasks(int id,
+                                                   int leadingHashZeros) {
+            var previousHash = bChain
+                    .isEmpty() ?
+                    "0" :
+                    bChain.getLast().getHash();
+            var mineTask = new MinerManager(
+                               new ChatFactory(
+                            leadingHashZeros,
+                            bChain.pollChat()),
+                    id, previousHash);
+            return Collections.nCopies(MINER_COUNT,
+                    mineTask);
+        }
+
+        private void errorExit(String message,
+                               Exception exception) {
+            chatClients.shutdownNow();
+            recorder.error(message);
+            exception.printStackTrace();
+            System.exit(1);
+        }
+    }
+  learner_created: false
+- name: src/blockchain/management/CryptoManager.java
+  visible: true
+  text: |-
+    package blockchain.management;
+
+    import blockchain.model.Post;
+    import blockchain.util.BlockChainSecurityException;
+    import lombok.NoArgsConstructor;
+    import java.security.InvalidKeyException;
+    import java.security.NoSuchAlgorithmException;
+    import java.security.PrivateKey;
+    import java.security.Signature;
+    import java.security.SignatureException;
+
+
+    @NoArgsConstructor
+    public class CryptoManager {
+
+        public static byte[] sign(String message,
+                                  PrivateKey privateKey) {
+            try {
+                var signature = Signature
+                        .getInstance("SHA1withRSA");
+                signature.initSign(
+                        privateKey);
+                signature.update(
+                        message.getBytes());
+                return signature.sign();
+
+            } catch (NoSuchAlgorithmException |
+                     InvalidKeyException |
+                     SignatureException e) {
+
+                throw new BlockChainSecurityException(
+                        "Exception signing chat message: "
+                                + e.getMessage());
+            }
+        }
+
+        public static boolean isValid(Post post) {
+            try {
+                var signature = Signature
+                        .getInstance("SHA1withRSA");
+                signature
+                        .initVerify(post.getPublicKey());
+                signature.update(
+                        post.getMessage().getBytes());
+                return signature.verify(
+                        post.getSigned());
+
+            } catch (NoSuchAlgorithmException |
+                     InvalidKeyException |
+                     SignatureException e) {
+
+                throw new BlockChainSecurityException(
+                        "Exception signing chat message: "
+                                + e.getMessage());
+            }
+        }
+    }
+  learner_created: false
+- name: src/blockchain/management/KeysManager.java
+  visible: true
+  text: |
+    package blockchain.management;
+
+    import java.io.FileWriter;
+    import java.io.IOException;
+    import java.security.KeyPair;
+    import java.security.KeyPairGenerator;
+    import java.security.NoSuchAlgorithmException;
+
+
+    public class KeysManager {
+
+        private final KeyPairGenerator keyGen;
+        private KeyPair keyPair;
+
+        public KeysManager(int keyLength)
+                throws NoSuchAlgorithmException {
+            this.keyGen = KeyPairGenerator
+                    .getInstance("RSA");
+            this.keyGen.initialize(keyLength);
+        }
+
+        public void createKeys(String publicKeyPath,
+                               String privateKeyPath)
+                               throws IOException {
+            keyPair = keyGen.generateKeyPair();
+            writeToFile(privateKeyPath,
+                         keyPair
+                                 .getPrivate()
+                                 .toString());
+            writeToFile(publicKeyPath,
+                        keyPair
+                            .getPublic()
+                            .toString());
+        }
+
+        public void writeToFile(String path,
+                                String key)
+                                throws IOException {
+
+            try (var fileWriter = new FileWriter(path)) {
+                fileWriter.write(key);
+                fileWriter.flush();
+
+            } catch (IOException e) {
+                throw new IOException(e.getMessage());
+            }
+        }
+
+        public KeyPair getKeyPair() {
+            return keyPair;
+        }
+    }
+  learner_created: false
+- name: src/blockchain/management/ValidationManager.java
+  visible: true
+  text: |
+    package blockchain.management;
+
+    import blockchain.model.Post;
+    import blockchain.model.block.Block;
+    import blockchain.model.Blockchain;
+    import blockchain.model.block.ChatImpl;
+    import blockchain.util.InvalidBlockchainException;
+    import lombok.extern.slf4j.Slf4j;
+
+    @Slf4j
+    public class ValidationManager {
+
+        private static final String ERROR =
+                "Invalid Blockchain !";
+
+        public void validateChain(Blockchain bChain)
+                            throws InvalidBlockchainException {
+
+            if (bChain.isEmpty()) {
+                return;
+            }
+            var curIter = bChain
+                    .descendingIterator();
+            var prevIter = bChain
+                    .descendingIterator();
+            var b = prevIter.next();
+            while (prevIter.hasNext()) {
+                b = curIter.next();
+                var previousB = prevIter.next();
+                if (isBlockValid(b, b
+                                .getLeadingHashZeros(),
+                        previousB)) {
+                    throw new InvalidBlockchainException(
+                            ERROR);
+                }
+                validateBlockMessages(b, previousB);
+            }
+            if (isBlockValid(b, b.getLeadingHashZeros(),
+                    null)) {
+                throw new InvalidBlockchainException(
+                        ERROR);
+            }
+        }
+
+        private void validateBlockMessages(Block b,
+                                           Block previousB) {
+
+            if (b instanceof ChatImpl chatB) {
+                ChatImpl previous = (ChatImpl) previousB;
+                if (chatB
+                        .getData()
+                        .stream()
+                        .anyMatch(post ->
+                                !isMessageValid(
+                                        post,
+                                        previous))) {
+                    throw new InvalidBlockchainException(
+                            ERROR);
+                }
+            }
+        }
+
+        public boolean isBlockValid(Block b,
+                                    int leadingHashZeros,
+                                    Block previousB) {
+            var valid = b
+                    .getHash()
+                    .startsWith(
+                            "0".repeat(leadingHashZeros));
+            if (previousB != null) {
+                valid &= b.hashMatchesPrevious(previousB);
+            }
+            return !valid;
+        }
+
+        public boolean isMessageValid(Post post,
+                                      Block previousB) {
+            if (previousB instanceof
+                    ChatImpl chatB) {
+                return CryptoManager
+                        .isValid(post) &&
+                        messageIdIsValid(post,
+                                chatB);
+            } else {
+                log.error(
+                        "Implementation error in BlockChain-Validator:" +
+                                " isMessageValid called with wrong block type");
+                throw new InvalidBlockchainException(
+                        "Implementation error - Blockchain-Validator " +
+                                "called with wrong block type.");
+            }
+        }
+
+        private boolean messageIdIsValid(Post post,
+                                         ChatImpl chatDataBlock) {
+            return chatDataBlock
+                    .getData()
+                    .stream()
+                    .noneMatch(p -> p.getId() >=
+                            post.getId());
+        }
+    }
+  learner_created: false
+- name: src/blockchain/util/PreInstaller.java
+  visible: true
+  text: |
+    package blockchain.util;
+
+    import lombok.NoArgsConstructor;
+    import java.util.HashMap;
+    import java.util.List;
+    import java.util.Map;
+
+    @NoArgsConstructor
+    public class PreInstaller {
+
+
+        public static final int BLOCKCHAIN_LENGTH = 6;
+
+        public static final String SERIALIZE_PATH =
+                "./blockchain/src/main/resources/data/blockchain.ser";
+        public static final String KEY_PAIRS_PATH_PREFIX =
+                "./blockchain/src/main/resources/data/";
+        public static final String PUBLIC_KEY_SUFFIX =
+                "_rsa.pub";
+        public static final String PRIVATE_KEY_SUFFIX = "_rsa";
+        public static final int RSA_KEY_LENGTH = 1024;
+
+        public static final int BLOCK_MIN_CREATION_SECONDS = 1;
+        public static final int BLOCK_MAX_CREATION_SECONDS = 5;
+        public static final int MAX_CHAT_PAUSE_MILLISECONDS = 300;
+
+        public static final List<String> CLIENTS =
+                List.of("Peter",
+                        "Mary",
+                        "Caspar",
+                        "Balthazar");
+        public static final int CHAT_CLIENT_COUNT = CLIENTS.size();
+        public static final int MINER_COUNT =
+                Runtime.getRuntime().availableProcessors() -
+                        CHAT_CLIENT_COUNT;
+
+        public static final Map<Integer, String> CHAT_MESSAGES;
+
+        static {
+            Map<Integer, String> chatMessageMap = new HashMap<>();
+            chatMessageMap.putAll(Map.of(
+                    1, "Allow Me to Introduce Myself.",
+                    2, "Good afternoon",
+                    3, "Good morning",
+                    4, "How are you?",
+                    5, "Hope this email finds you well",
+                    6, "I hope you enjoyed your weekend",
+                    7, "I hope you're doing well",
+                    8, "I hope you're having a great week",
+                    9, "I hope you're having a wonderful day",
+                    10, "It's great to hear from you"
+            ));
+            chatMessageMap.putAll(Map.of(
+                    11, "I'm eager to get your advice on that",
+                    12, "I'm reaching out about some urgent matter",
+                    13, "Thank you for your help",
+                    14, "Thank you for the update",
+                    15, "Thanks for getting in touch",
+                    16, "Thanks for the quick response",
+                    17, "As promised, I'm back",
+                    18, "As we discussed on our call, I like you",
+                    19, "Can you provide me with an update",
+                    20, "I'm checking in on my cat"
+            ));
+            chatMessageMap.putAll(Map.of(
+                    21, "I'm getting back to you about that",
+                    22, "To follow up on our meeting",
+                    23, "Congratulations on your recent accomplishment",
+                    24, "How did the recent project turn out?",
+                    25, "I hope you enjoyed your vacation",
+                    26, "I loved your recent social media post",
+                    27, "I was just laughing the other day about an inside joke",
+                    28, "I was just thinking about you and our shared memory",
+                    29, "It was great to see you at the fair",
+                    30, "This video made me think of you"
+            ));
+            CHAT_MESSAGES = Map.copyOf(chatMessageMap);
+        }
+    }
+  learner_created: false
+- name: src/blockchain/util/InvalidBlockchainException.java
+  visible: true
+  text: |-
+    package blockchain.util;
+
+
+
+    public class InvalidBlockchainException
+                                   extends RuntimeException {
+
+        public InvalidBlockchainException(String message) {
+            super(message);
+        }
+    }
+  learner_created: false
+- name: src/blockchain/util/BlockChainSecurityException.java
+  visible: true
+  text: |-
+    package blockchain.util;
+
+    public class BlockChainSecurityException extends
+                                             RuntimeException {
+        public BlockChainSecurityException(String message) {
+            super(message);
+        }
+    }
+  learner_created: false
+- name: src/blockchain/model/Post.java
+  visible: true
+  text: |
+    package blockchain.model;
+
+    import lombok.Getter;
+
+    import java.io.Serial;
+    import java.io.Serializable;
+    import java.security.PublicKey;
+
+
+    @Getter
+    public class Post implements Serializable {
+
+        @Serial
+        private static final long serialVersionUID = 50L;
+
+        private final String message;
+        private final int id;
+        private final PublicKey publicKey;
+        private final byte[] signed;
+
+        public Post(String message,
+                    int id,
+                    PublicKey publicKey,
+                    byte[] signed) {
+            this.message = message;
+            this.id = id;
+            this.publicKey = publicKey;
+            this.signed = signed;
+        }
+
+        @Override
+        public String toString() {
+            return message;
+        }
+    }
+  learner_created: false
+- name: src/blockchain/model/block/Block.java
+  visible: true
+  text: |-
+    package blockchain.model.block;
+    import java.io.Serializable;
+
+
+    public interface Block extends Serializable {
+
+        String getHash();
+
+        String getPreviousHash();
+
+        default boolean hashMatchesPrevious(Block previousBlock) {
+            return getPreviousHash()
+                    .equals(previousBlock.getHash());
+        }
+
+        long getTimestamp();
+
+        long getElapsedTimeInSeconds();
+
+        int getLeadingHashZeros();
+
+        void setMinerId(int minerId);
+
+        void setHash(String hash);
+
+        void setElapsedTimeInSeconds(long elapsedTimeInSeconds);
+
+        void setLeadingHashZeros(int leadingHashZeros);
+
+        void setMagicNumber(int magicNumber);
+    }
+  learner_created: false
+- name: src/blockchain/model/block/MagicImpl.java
+  visible: true
+  text: |
+    package blockchain.model.block;
+
+    import lombok.AllArgsConstructor;
+    import lombok.Data;
+    import lombok.NoArgsConstructor;
+    import java.io.Serial;
+    import java.util.Date;
+
+    @AllArgsConstructor
+    @NoArgsConstructor
+    @Data
+    public class MagicImpl implements Block {
+        @Serial
+        private static final long serialVersionUID = 35L;
+
+        private long id;
+        private long timestamp;
+        private long elapsedTimeInSeconds;
+        private int magicNumber;
+        private String previousHash;
+        private String hash = "";
+        private int leadingHashZeros;
+        private int minerId = 0;
+
+        public MagicImpl(int id,
+                         String previousHash) {
+            this.id = id;
+            this.previousHash = previousHash;
+            this.timestamp = new Date()
+                    .getTime();
+        }
+
+        @Override
+        public String toString() {
+            return getBlockStateString() +
+                    getGeneratingString();
+        }
+
+        protected String getBlockStateString() {
+            return ("Block:%nCreated by miner # %d%nId:" +
+                    " %d%nTimestamp: %d%nMagic number: " +
+                    "%d%n" +
+                    "Hash of the previous block:" +
+                    "%n%s%nHash of the block:%n%s%n")
+                    .formatted(minerId,
+                            id,
+                            timestamp,
+                            magicNumber,
+                            previousHash,
+                            hash);
+        }
+
+        protected String getGeneratingString() {
+            return ("Block was generating for %d" +
+                    " seconds%n")
+                    .formatted(elapsedTimeInSeconds);
+        }
+    }
+  learner_created: false
+- name: src/blockchain/model/block/ChatImpl.java
+  visible: true
+  text: |-
+    package blockchain.model.block;
+
+    import blockchain.model.Post;
+
+    import java.io.Serial;
+    import java.util.List;
+
+
+    public class ChatImpl implements Data<List<Post>> {
+        @Serial
+        private static final long serialVersionUID = 43L;
+
+        private final MagicImpl block;
+        private List<Post> data = null;
+
+        public ChatImpl(Block block) {
+            this.block = (MagicImpl) block;
+        }
+
+        @Override
+        public String toString() {
+            return block.getBlockStateString() +
+                    getDataString() +
+                    block.getGeneratingString();
+        }
+
+        protected String getDataString() {
+            if (getData().isEmpty()) {
+                return "Block data: no messages\n";
+            }
+
+            var sb = new StringBuilder("Block data:\n");
+            getData()
+                    .forEach(e -> sb
+                    .append(e)
+                    .append("\n"));
+            return sb.toString();
+        }
+
+        @Override
+        public String getHash() {
+            return block.getHash();
+        }
+
+        @Override
+        public void setHash(String hash) {
+            block.setHash(hash);
+        }
+
+        @Override
+        public String getPreviousHash() {
+            return block
+                    .getPreviousHash();
+        }
+
+        @Override
+        public long getTimestamp() {
+            return block
+                    .getTimestamp();
+        }
+
+        @Override
+        public long getElapsedTimeInSeconds() {
+            return block
+                    .getElapsedTimeInSeconds();
+        }
+
+        @Override
+        public void setElapsedTimeInSeconds(long elapsedTimeInSeconds) {
+            block
+                    .setElapsedTimeInSeconds(
+                            elapsedTimeInSeconds);
+        }
+
+        @Override
+        public int getLeadingHashZeros() {
+            return block.getLeadingHashZeros();
+        }
+
+        @Override
+        public void setLeadingHashZeros(int leadingHashZeros) {
+            block
+                    .setLeadingHashZeros(leadingHashZeros);
+        }
+
+        @Override
+        public void setMagicNumber(int magicNumber) {
+            block
+                    .setMagicNumber(magicNumber);
+        }
+
+        @Override
+        public void setMinerId(int minerId) {
+            block.setMinerId(minerId);
+        }
+
+        @Override
+        public List<Post> getData() {
+            return data;
+        }
+
+        @Override
+        public void setData(List<Post> data) {
+            this.data = data;
+        }
+    }
+  learner_created: false
+- name: src/blockchain/model/block/Data.java
+  visible: true
+  text: |
+    package blockchain.model.block;
+
+    public interface Data<T> extends Block {
+
+        T getData();
+
+        void setData(T data);
+    }
+  learner_created: false
+- name: src/blockchain/model/factories/BlockFactory.java
+  visible: true
+  text: |
+    package blockchain.model.factories;
+
+    import blockchain.model.block.Block;
+
+    import java.security.NoSuchAlgorithmException;
+
+
+    public abstract class BlockFactory {
+
+        public Block createBlock(int id,
+                                 String previousHash)
+                        throws NoSuchAlgorithmException {
+
+            var block = newBlockInstance(id,
+                              previousHash);
+            setBlockData(block);
+            setHashRelatedFields(block);
+            return block;
+        }
+
+        protected void setBlockData(Block block) {
+        }
+
+        protected abstract Block newBlockInstance(int id,
+                                                  String previousHash);
+
+        protected abstract void setHashRelatedFields(Block block)
+                          throws NoSuchAlgorithmException;
+    }
+  learner_created: false
+- name: src/blockchain/model/factories/MagicFactory.java
+  visible: true
+  text: |
+    package blockchain.model.factories;
+
+    import blockchain.model.block.Block;
+    import blockchain.model.block.MagicImpl;
+    import blockchain.util.StringUtil;
+
+    import java.util.Date;
+    import java.util.Random;
+
+
+    public class MagicFactory extends BlockFactory {
+
+        private final String leadingZeroString;
+        private final Random random = new Random();
+
+        public MagicFactory(int leadingHashZeros) {
+            this.leadingZeroString = "0"
+                    .repeat(leadingHashZeros);
+        }
+        @Override
+        protected Block newBlockInstance(int id,
+                                         String previousHash) {
+            return new MagicImpl(id, previousHash);
+        }
+
+        @Override
+        protected void setHashRelatedFields(Block b) {
+            String hash;
+
+            do {
+                b.setMagicNumber(random.nextInt(
+                        Integer.MAX_VALUE));
+                hash = StringUtil
+                        .applySha256(b.toString());
+            } while (!hash
+                    .startsWith(leadingZeroString)
+                    &&
+                    !Thread.interrupted());
+            b.setHash(hash);
+            b.setElapsedTimeInSeconds((
+                    new Date().getTime() -
+                            b.getTimestamp())
+                    / 1000);
+            b.setLeadingHashZeros(
+                    leadingZeroString.length());
+        }
+    }
+  learner_created: false
+- name: src/blockchain/model/factories/ChatFactory.java
+  visible: true
+  text: |
+    package blockchain.model.factories;
+
+    import blockchain.model.Post;
+    import blockchain.model.block.Block;
+    import blockchain.model.block.ChatImpl;
+
+    import java.util.List;
+
+
+    public class ChatFactory extends MagicFactory {
+
+        private final List<Post> chat;
+
+        public ChatFactory(int leadingHashZeros,
+                           List<Post> chat) {
+            super(leadingHashZeros);
+            this.chat = chat;
+        }
+
+        @Override
+        protected Block newBlockInstance(int id,
+                                         String previousHash) {
+            return new ChatImpl(super.newBlockInstance(
+                    id, previousHash));
+        }
+
+        @Override
+        protected void setBlockData(Block b) {
+            if (b instanceof ChatImpl chatB) {
+                chatB.setData(chat);
+            } else {
+                System.exit(1);
+            }
+        }
+    }
+  learner_created: false
+- name: src/blockchain/model/Blockchain.java
+  visible: true
+  text: |2-
+     package blockchain.model;
+
+     import blockchain.management.ValidationManager;
+     import blockchain.model.block.Block;
+     import blockchain.util.InvalidBlockchainException;
+     import blockchain.util.PreInstaller;
+     import blockchain.util.Serializer;
+     import lombok.extern.slf4j.Slf4j;
+
+     import java.io.Serial;
+     import java.util.ArrayList;
+     import java.util.LinkedList;
+     import java.util.List;
+     import java.util.Queue;
+     import java.util.concurrent.ConcurrentLinkedQueue;
+     import java.util.concurrent.atomic.AtomicInteger;
+
+
+     @Slf4j
+
+     public class Blockchain extends LinkedList<Block> {
+
+         @Serial
+         private static final long serialVersionUID = 12L;
+
+         private static final ValidationManager VALIDATOR =
+                 new ValidationManager();
+         private static final Serializer SERIALIZER =
+                 new Serializer();
+
+         private final AtomicInteger messageIdCount = new AtomicInteger(0);
+         private transient Queue<Post> postsQueue = null;
+         private transient int currentLeadingHashZeros = 0;
+
+         public static Serializer getSerializer() {
+             return SERIALIZER;
+         }
+
+         public boolean addBlock(Block newBlock) {
+             if (VALIDATOR.isBlockValid(newBlock,
+                     currentLeadingHashZeros,
+                     isEmpty() ?
+                             null : getLast())) {
+                 return false;
+             }
+             add(newBlock);
+             SERIALIZER.serialize(this);
+             return true;
+         }
+
+         public void resetIfInvalid() {
+             try {
+                 VALIDATOR.validateChain(this);
+             } catch (InvalidBlockchainException exc) {
+                 log.warn(
+                         "Invalid blockchain deserialized!" +
+                                 "\n" +
+                                 "Start generating from scratch.");
+                 clear();
+             }
+         }
+
+
+         public int adaptLeadingHashZeros() {
+             if (getLast()
+                     .getElapsedTimeInSeconds() <
+                     PreInstaller
+                             .BLOCK_MIN_CREATION_SECONDS) {
+                 ++currentLeadingHashZeros;
+             } else if (getLast()
+                     .getElapsedTimeInSeconds() >
+                     PreInstaller
+                             .BLOCK_MAX_CREATION_SECONDS) {
+                 --currentLeadingHashZeros;
+             }
+             return currentLeadingHashZeros;
+         }
+
+         public int getMessageId() {
+             return messageIdCount.incrementAndGet();
+         }
+
+
+         public synchronized void sendChatMessage(Post post) {
+             if (postsQueue != null) {
+                 if (VALIDATOR
+                         .isMessageValid(post, getLast())) {
+                     postsQueue.offer(post);
+                 } else {
+                     log.warn((
+                             "Invalid digital message <%s> "
+                                     + "received ")
+                             .formatted(post
+                                     .getMessage()));
+                 }
+             }
+         }
+
+         public synchronized List<Post> pollChat() {
+             List<Post> chatData = new ArrayList<>();
+             if (postsQueue == null) {
+                 postsQueue =
+                         new ConcurrentLinkedQueue<>();
+             }
+             while (!postsQueue.isEmpty()) {
+                 chatData.add(postsQueue.poll());
+             }
+             return chatData;
+         }
+
+
+         @Override
+         public String toString() {
+             var sb = new StringBuilder();
+             for (int i = 0; i < size(); i++) {
+                 sb.append(get(i));
+                 sb.append(
+                         getChangeOfZeroText(
+                                 get(i).getLeadingHashZeros(),
+                                 i < size() - 1 ?
+                                 get(i + 1).getLeadingHashZeros()
+                                         : currentLeadingHashZeros));
+             }
+             return sb.toString();
+         }
+
+
+         private String getChangeOfZeroText(int leadingZeros,
+                                            int nextLeadingZeros) {
+             if (leadingZeros > nextLeadingZeros) {
+                 return "N was decreased by %d%n%n"
+                         .formatted(
+                         leadingZeros - nextLeadingZeros);
+             } else if (leadingZeros < nextLeadingZeros) {
+                 return "N was increased to %d%n%n"
+                         .formatted(nextLeadingZeros);
+             }
+             return "N stays the same\n\n";
+         }
+
+         @Override
+         public boolean equals(Object other) {
+             return super.equals(other);
+         }
+
+         @Override
+         public int hashCode() {
+             return super.hashCode();
+         }
+     }
+  learner_created: false
+- name: src/blockchain/management/MinerManager.java
+  visible: true
+  text: |
+    package blockchain.management;
+
+
+    import blockchain.model.block.Block;
+    import blockchain.model.factories.ChatFactory;
+
+    import java.util.concurrent.Callable;
+
+    public class MinerManager implements Callable<Block> {
+
+        private final int id;
+        private final String previousHash;
+        private final ChatFactory factory;
+
+        public MinerManager(ChatFactory factory,
+                           int id,
+                           String previousHash) {
+            this.factory = factory;
+            this.id = id;
+            this.previousHash = previousHash;
+        }
+
+        @Override
+        public Block call() throws Exception {
+            var block = factory
+                             .createBlock(id, previousHash);
+            var threadName = Thread
+                                      .currentThread()
+                                       .getName();
+            block.setMinerId(Integer
+                    .parseInt(
+                    threadName
+                    .substring(
+                    threadName
+                    .lastIndexOf('-') + 1)));
+            return block;
+        }
+    }
+  learner_created: false
+- name: src/blockchain/management/UserManager.java
+  visible: true
+  text: |
+    package blockchain.management;
+
+    import blockchain.model.Blockchain;
+    import blockchain.model.Post;
+    import static blockchain.util.PreInstaller.CHAT_MESSAGES;
+    import static blockchain.util.PreInstaller.MAX_CHAT_PAUSE_MILLISECONDS;
+    import java.security.KeyPair;
+    import java.util.Random;
+
+    /**
+     * Runnable implementation, that is performed in the chat clients thread pool.
+     * Creates random messages in random time intervals both configured in the BlockchainConfig.
+     */
+    public class UserManager implements Runnable {
+
+        private static final Random RANDOM = new Random();
+
+        private final Blockchain bChain;
+        private final String name;
+        private final KeyPair keyPair;
+
+        public UserManager(Blockchain bChain,
+                           String threadName,
+                           KeyPair keyPair) {
+            this.bChain = bChain;
+            this.name = threadName;
+            this.keyPair = keyPair;
+        }
+
+        @Override
+        public void run() {
+            try {
+                while (!Thread.interrupted()) {
+                    Thread.sleep(
+                            RANDOM.nextInt(
+                            MAX_CHAT_PAUSE_MILLISECONDS));
+                    var messageId = bChain.getMessageId();
+                    var message = String.format(
+                            "%s [Id %d]: %s",
+                            name,
+                            messageId,
+                            CHAT_MESSAGES.get(
+                                    RANDOM.nextInt(
+                                    CHAT_MESSAGES.size()) + 1));
+                    Post post = new Post(message,
+                            messageId,
+                            keyPair.getPublic(),
+                            CryptoManager.sign(
+                                    message,
+                                    keyPair.getPrivate()));
+                    bChain.sendChatMessage(post);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+  learner_created: false
+- name: src/blockchain/util/Recorder.java
+  visible: true
+  text: |
+    package blockchain.util;
+
+    import lombok.extern.slf4j.Slf4j;
+
+    @Slf4j
+    public class Recorder {
+
+        public void print(Object bChain) {
+            log.info(bChain.toString());
+        }
+
+        public void error(String message) {
+            log.error(message);
+        }
+    }
+  learner_created: false
+- name: src/resources/log4j2.xml
+  visible: true
+  learner_created: false
+- name: src/resources/blockchain.ser
+  visible: true
+  learner_created: false
+- name: src/resources/blockchain.txt
+  visible: true
+  text: |
+    0:miner4:1:1666703921977:28747785:0:866e5e5abad9c1a4429416ae48840a9b34708fb4452263d7a8bac7aefc419588::112:
+  learner_created: false
+- name: src/resources/Database.txt
+  visible: true
+  text: "��\0\x05sr\0\eblockchain.block.Blockchain3l`���<\x15\x02\0\x02I\0\x06zeroesL\0\
+    \x06blockst\0\x10Ljava/util/List;xp\0\0\0\x02sr\0\x13java.util.ArrayListx��\x1d\
+    ��a�\x03\0\x01I\0\x04sizexp\0\0\0\x05w\x04\0\0\0\x05sr\0\x16blockchain.block.Block\x18\
+    \ �\x11��zB\x02\0\x06I\0\x02idJ\0\vmagicNumberI\0\x0etimeToGenerateJ\0\ttimestampL\0\
+    \tblockHasht\0\x12Ljava/lang/String;L\0\nprevBlockHashq\0~\0\x06xp\0\0\0\0�d\x1d\
+    �\x06V+f\0\0\0\0\0\0\x01��\n�\x10t\0@0032ade335adc93aee375ebf9fe7c0734929a4e06dacd2ea3ad7e5e4a631bebdt\0\
+    \x010sq\0~\0\x05\0\0\0\x01��]\n �V�\0\0\0\0\0\0\x01��\n�Rt\0@001aba86173044036fc8ea2ea84386fb1b9aad13ad759b5587115793a9ad9163q\0\
+    ~\0\bsq\0~\0\x05\0\0\0\x02t��}���\0\0\0\0\0\0\x01��\n�Ut\0@009df7703e0322c96afe254c796b8f355035cf3948531dab3cf22e0145342ae3q\0\
+    ~\0\vsq\0~\0\x05\0\0\0\x03�\b\x17��,W�\0\0\0\0\0\0\x01��\n�bt\0@009521a80d64679c72f334fe44507e42bae319b6c27bce6a0ef87f9b7186e90eq\0\
+    ~\0\nsq\0~\0\x05\0\0\0\x04��g���U�\0\0\0\0\0\0\x01��\n�vt\0@0045a661f20d5c1a5593a6b7025a41282f9d9b4d4bee2b3a2e8d7c606052a589q\0\
+    ~\0\x0fx"
+  learner_created: false
+- name: test/BlockchainTest.java
+  visible: false
+  text: |
+    import org.hyperskill.hstest.stage.StageTest;
+    import org.hyperskill.hstest.testcase.CheckResult;
+    import org.hyperskill.hstest.testcase.TestCase;
+
+    import java.util.ArrayList;
+    import java.util.List;
+    import java.util.Objects;
+    import java.util.regex.Matcher;
+    import java.util.regex.Pattern;
+    import java.util.stream.Collectors;
+
+
+    class BlockParseException extends Exception {
+        BlockParseException(String msg) {
+            super(msg);
+        }
+    }
+
+
+    class Block {
+
+        int id;
+        long timestamp;
+        long magic;
+        String hashprev;
+        String hash;
+
+        static ArrayList<String> minerIds;
+
+        static Block parseBlock(String strBlock) throws BlockParseException {
+            if (strBlock.length() == 0) {
+                return null;
+            }
+
+            if (!(strBlock.contains("Block:")
+                    && strBlock.contains("Timestamp:"))) {
+
+                return null;
+            }
+
+            Block block = new Block();
+
+            List<String> lines = strBlock
+                    .lines()
+                    .map(String::strip)
+                    .filter(e -> e.length() > 0)
+                    .collect(Collectors.toList());
+
+            if (lines.size() < 13) {
+                throw new BlockParseException("Every block should " +
+                        "contain at least 13 lines of data");
+            }
+
+            if (!lines.get(0).equals("Block:")) {
+                throw new BlockParseException("First line of every block " +
+                        "should be \"Block:\"");
+            }
+
+            if (!lines.get(1).startsWith("Created by")) {
+                throw new BlockParseException("Second line of every block " +
+                        "should start with \"Created by\"");
+            }
+
+            minerIds.add(lines.get(1));
+
+            if (!lines.get(2).contains("gets 100 VC")) {
+                throw new BlockParseException("Third line of every block " +
+                        "should contain \"gets 100 VC\"");
+            }
+
+            //The miner who created the block must be the miner who gets the VC
+            Pattern p = Pattern.compile(".*(miner\\d+).*", Pattern.CASE_INSENSITIVE);
+            try {
+                Matcher m1 = p.matcher(lines.get(1));
+                Matcher m2 = p.matcher(lines.get(2));
+                if (!m1.find() || !m2.find()){
+                    throw new BlockParseException("All miner names should be in the format 'miner#', as in 'miner1'");
+                }
+
+                boolean ok = m1.group(1).equals(m2.group(1));
+                if (!ok) {
+                    throw new BlockParseException("The miner who creates the block must get the VC!");
+                }
+            } catch (IllegalStateException e) {
+                throw new BlockParseException("Illegal state ");
+            } catch (IndexOutOfBoundsException e){
+                throw new BlockParseException("All miner names should be in the format 'miner#', as in 'miner1'");
+            }
+
+            if (!lines.get(3).startsWith("Id:")) {
+                throw new BlockParseException("4-th line of every block " +
+                        "should start with \"Id:\"");
+            }
+
+            String id = lines.get(3).split(":")[1]
+                    .strip().replace("-", "");
+            boolean isNumeric = id.chars().allMatch(Character::isDigit);
+
+            if (!isNumeric) {
+                throw new BlockParseException("Id should be a number");
+            }
+
+            block.id = Integer.parseInt(id);
+
+
+
+            if (!lines.get(4).startsWith("Timestamp:")) {
+                throw new BlockParseException("5-th line of every block " +
+                        "should start with \"Timestamp:\"");
+            }
+
+            String timestamp = lines.get(4).split(":")[1]
+                    .strip().replace("-", "");
+            isNumeric = timestamp.chars().allMatch(Character::isDigit);
+
+            if (!isNumeric) {
+                throw new BlockParseException("Timestamp should be a number");
+            }
+
+            block.timestamp = Long.parseLong(timestamp);
+
+
+            if (!lines.get(5).startsWith("Magic number:")) {
+                throw new BlockParseException("6-th line of every block " +
+                        "should start with \"Magic number:\"");
+            }
+
+            String magic = lines.get(5).split(":")[1]
+                    .strip().replace("-", "");
+            isNumeric = magic.chars().allMatch(Character::isDigit);
+
+            if (!isNumeric) {
+                throw new BlockParseException("Magic number should be a number");
+            }
+
+            block.magic = Long.parseLong(magic);
+
+
+
+            if (!lines.get(6).equals("Hash of the previous block:")) {
+                throw new BlockParseException("7-th line of every block " +
+                        "should be \"Hash of the previous block:\"");
+            }
+
+            if (!lines.get(8).equals("Hash of the block:")) {
+                throw new BlockParseException("9-th line of every block " +
+                        "should be \"Hash of the block:\"");
+            }
+
+            String prevhash = lines.get(7).strip();
+            String hash = lines.get(9).strip();
+
+            if (!(prevhash.length() == 64 || prevhash.equals("0"))
+                    || !(hash.length() == 64)) {
+
+                throw new BlockParseException("Hash length should " +
+                        "be equal to 64 except \"0\"");
+            }
+
+            block.hash = hash;
+            block.hashprev = prevhash;
+
+            if (!lines.get(10).startsWith("Block data:")) {
+                throw new BlockParseException("11-th line of every block " +
+                        "should start with \"Block data:\"");
+            }
+
+            return block;
+        }
+
+
+        static List<Block> parseBlocks(String output) throws BlockParseException {
+            minerIds = new ArrayList<String>();
+
+            String[] strBlocks = output.split("\n\n");
+
+            List<Block> blocks = new ArrayList<>();
+
+            for (String strBlock : strBlocks) {
+                Block block = parseBlock(strBlock.strip());
+                if (block != null) {
+                    blocks.add(block);
+                }
+            }
+
+            String firstMiner = minerIds.get(0);
+            minerIds.removeIf(s -> Objects.equals(s, firstMiner));
+            if (minerIds.size() == 0){
+                throw new BlockParseException("All blocks are mined by a single miner!");
+            }
+
+            return blocks;
+        }
+    }
+
+    class Clue {
+        String zeros;
+        Clue(int n) {
+            zeros = "0".repeat(n);
+        }
+    }
+
+
+    public class BlockchainTest extends StageTest<Clue> {
+
+        List<String> previousOutputs = new ArrayList<>();
+
+        @Override
+        public List<TestCase<Clue>> generate() {
+            return List.of(
+                    new TestCase<>(),
+                    new TestCase<>()
+            );
+        }
+
+        @Override
+        public CheckResult check(String reply, Clue clue) {
+
+            if (previousOutputs.contains(reply)) {
+                return new CheckResult(false,
+                        "You already printed this text in the previous tests");
+            }
+
+            previousOutputs.add(reply);
+
+            List<Block> blocks;
+            try {
+                blocks = Block.parseBlocks(reply);
+            } catch (BlockParseException ex) {
+                return new CheckResult(false, ex.getMessage());
+            } catch (Exception ex) {
+                return CheckResult.wrong("");
+            }
+
+            if (blocks.size() != 15) {
+                return new CheckResult(false,
+                        "In this stage you should output 15 blocks, found " + blocks.size());
+            }
+
+            for (int i = 1; i < blocks.size(); i++) {
+                Block curr = blocks.get(i - 1);
+                Block next = blocks.get(i);
+
+                if (curr.id + 1 != next.id) {
+                    return new CheckResult(false,
+                            "Id`s of blocks should increase by 1");
+                }
+
+                if (next.timestamp < curr.timestamp) {
+                    return new CheckResult(false,
+                            "Timestamp`s of blocks should increase");
+                }
+
+                if (!next.hashprev.equals(curr.hash)) {
+                    return new CheckResult(false, "Two hashes aren't equal, " +
+                            "but should");
+                }
+            }
+
+
+            return CheckResult.correct();
+        }
+    }
+  learner_created: false
+feedback_link: https://hyperskill.org/learn/step/5418#comment
+status: Solved
+record: 5
